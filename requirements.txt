@@ -1,2 +1,3 @@
 pycryptodome
 pypsexec
+pywin32
