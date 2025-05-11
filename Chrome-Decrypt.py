@@ -27,16 +27,6 @@ def is_admin():
         logging.error(f"Failed to check admin privileges: {e}")
         return False
 
-def elevate_privileges():
-    """Relaunch the script with administrator privileges."""
-    logging.info("Script requires administrator privileges. Attempting to relaunch...")
-    try:
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join([sys.argv[0]] + sys.argv[1:]), None, 1)
-        sys.exit(0)
-    except Exception as e:
-        logging.error(f"Failed to elevate privileges: {e}")
-        sys.exit(1)
-
 def get_encryption_key():
     """Retrieve and decrypt the Chrome encryption key."""
     user_profile = os.environ.get('USERPROFILE')
@@ -165,8 +155,15 @@ def fetch_cookies():
         cookies_v20 = [c for c in cookies if c[2][:3] == b"v20"]
         con.close()
         return cookies_v20
-    except sqlite3.Error as e:
-        logging.error(f"Failed to fetch cookies: {e}")
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e):
+            logging.error("Cookies database is locked. Please close Chrome and try again.")
+            sys.exit(1)
+        else:
+            logging.error(f"Failed to fetch cookies: {e}")
+            return []
+    except Exception as e:
+        logging.error(f"Unexpected error while fetching cookies: {e}")
         return []
 
 def fetch_passwords():
@@ -181,8 +178,15 @@ def fetch_passwords():
         passwords_v20 = [p for p in passwords if p[2][:3] == b"v20"]
         con.close()
         return passwords_v20
-    except sqlite3.Error as e:
-        logging.error(f"Failed to fetch passwords: {e}")
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e):
+            logging.error("Passwords database is locked. Please close Chrome and try again.")
+            sys.exit(1)
+        else:
+            logging.error(f"Failed to fetch passwords: {e}")
+            return []
+    except Exception as e:
+        logging.error(f"Unexpected error while fetching passwords: {e}")
         return []
 
 def output_data(cookies, passwords, output_format, output_file, key):
@@ -261,7 +265,8 @@ def main():
     setup_logging(args.verbose)
 
     if not is_admin():
-        elevate_privileges()
+        logging.error("This script requires administrator privileges to run.")
+        sys.exit(1)
 
     key = get_encryption_key()
     logging.debug(f"Decrypted key: {binascii.b2a_base64(key).decode().strip()}")
